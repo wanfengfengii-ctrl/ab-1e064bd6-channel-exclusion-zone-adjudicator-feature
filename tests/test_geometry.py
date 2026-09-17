@@ -15,7 +15,10 @@ from app.geometry import (
     MAX_POINT_COUNT,
     MAX_POCKET_COUNT,
     MAX_TOTAL_VERTEX_COUNT,
+    MAX_TRACK_POINT_COUNT,
+    MIN_TRACK_POINT_COUNT,
     PolygonError,
+    adjudicate_track,
     classify,
     containing_pocket,
     doubled_area,
@@ -565,3 +568,221 @@ def test_doubled_area_net_conservation_with_pockets():
     assert doubled_area(region) == 20000
     assert [doubled_area(p) for p in pockets] == [200, 200]
     assert net == 19600
+
+
+# ---------------------------------------------------------------------------
+# 连续航迹：逐航段首次接触（约分有理数、边序号归因、方向反转不变量）
+# ---------------------------------------------------------------------------
+
+SQUARE_TRACK = [(0, 0), (10, 0), (10, 10), (0, 10)]
+L_TRACK = [(0, 0), (10, 0), (10, 4), (4, 4), (4, 10), (0, 10)]
+
+
+def contact_tuple(c):
+    if c is None:
+        return None
+    return (
+        c.segment_index,
+        (c.t_num, c.t_den),
+        (c.x_num, c.x_den, c.y_num, c.y_den),
+        c.edge_index,
+    )
+
+
+def test_track_waypoint_limits_constants():
+    assert MIN_TRACK_POINT_COUNT == 2
+    assert MAX_TRACK_POINT_COUNT == 100
+
+
+def test_track_cross_through_blocked_at_first_entry():
+    # 两端航点都放行（外部），航段中途穿区：定位首次入口 (0,5)，t=1/4，边 3。
+    poly = prepare_polygon(SQUARE_TRACK)
+    c = adjudicate_track(poly, [(-5, 5), (15, 5)])
+    assert contact_tuple(c) == (0, (1, 4), (0, 1, 5, 1), 3)
+
+
+def test_track_grazing_vertex_is_blocked_with_smallest_edge():
+    # 外部 -> 顶点 -> 外部的相切航段仍阻断：接触 (0,0)，同时命中边 0/3，取最小 0。
+    poly = prepare_polygon(SQUARE_TRACK)
+    c = adjudicate_track(poly, [(-5, 5), (5, -5)])
+    assert contact_tuple(c) == (0, (1, 2), (0, 1, 0, 1), 0)
+
+
+def test_track_sailing_along_boundary_is_stably_blocked():
+    # 沿边航行（含从边延长线贴上）：共线贴边取重叠起点 (0,0)，边 0。
+    poly = prepare_polygon(SQUARE_TRACK)
+    c = adjudicate_track(poly, [(-5, 0), (5, 0)])
+    assert contact_tuple(c) == (0, (1, 2), (0, 1, 0, 1), 0)
+    # 起点已在边上：参数为零，边序号沿用点分类。
+    c0 = adjudicate_track(poly, [(2, 0), (8, 0)])
+    assert contact_tuple(c0) == (0, (0, 1), (2, 1, 0, 1), 0)
+    # 凹多边形的凹口边沿 x=4：从延长线贴上，重叠起点 (4,10)，t=1/6。
+    lpoly = prepare_polygon(L_TRACK)
+    cl = adjudicate_track(lpoly, [(4, 11), (4, 5)])
+    assert contact_tuple(cl) == (0, (1, 6), (4, 1, 10, 1), 3)
+
+
+def test_track_full_detour_returns_clear():
+    poly = prepare_polygon(SQUARE_TRACK)
+    assert adjudicate_track(poly, [(-5, 5), (-5, 15), (15, 15), (15, 5)]) is None
+    # 凹多边形：西侧外点到凹口外东侧点，经顶部外侧绕行全程不接触 => CLEAR；
+    # 而直接横穿（首段 (-2,8)->(2,8) 进入竖臂）必然阻断。
+    lpoly = prepare_polygon(L_TRACK)
+    assert adjudicate_track(lpoly, [(-2, 8), (-2, 12), (12, 12), (12, 6)]) is None
+    assert adjudicate_track(lpoly, [(-2, 8), (2, 8)]) is not None
+
+
+def test_track_start_already_forbidden_has_zero_parameter():
+    poly = prepare_polygon(SQUARE_TRACK)
+    # 严格内部起点：t=0，坐标即起点，不归因任何边。
+    c = adjudicate_track(poly, [(5, 5), (15, 5)])
+    assert contact_tuple(c) == (0, (0, 1), (5, 1, 5, 1), None)
+    # 边界起点：t=0，边序号为最小命中边。
+    cb = adjudicate_track(poly, [(0, 0), (15, 5)])
+    assert contact_tuple(cb) == (0, (0, 1), (0, 1, 0, 1), 0)
+
+
+def test_track_zero_length_segment_uses_single_point_rule():
+    poly = prepare_polygon(SQUARE_TRACK)
+    assert adjudicate_track(poly, [(-5, -5), (-5, -5)]) is None
+    c = adjudicate_track(poly, [(5, 5), (5, 5)])
+    assert contact_tuple(c) == (0, (0, 1), (5, 1, 5, 1), None)
+    cb = adjudicate_track(poly, [(0, 0), (0, 0)])
+    assert contact_tuple(cb) == (0, (0, 1), (0, 1, 0, 1), 0)
+    # 外部零长度段不得掩盖其后首个越界航段：段 1 从 (-5,-5) 到 (15,5)，
+    # 首次接触 (5,0)，t=1/2，边 0。
+    cn = adjudicate_track(poly, [(-5, -5), (-5, -5), (15, 5)])
+    assert contact_tuple(cn) == (1, (1, 2), (5, 1, 0, 1), 0)
+
+
+def test_track_earliest_restricted_segment_index():
+    # 前两个航段在外绕行，第 3 段 (5,15)->(5,-5) 首次穿区：序号 2，入口 (5,10)。
+    poly = prepare_polygon(SQUARE_TRACK)
+    c = adjudicate_track(poly, [(-5, -5), (-5, 15), (5, 15), (5, -5)])
+    assert contact_tuple(c) == (2, (1, 4), (5, 1, 10, 1), 2)
+
+
+def test_track_fractional_parameter_and_coordinates_are_reduced():
+    # 三角形斜边 x+y=10：(8,7) 外 -> (3,4) 内，t=5/8，接触点 (39/8, 41/8)。
+    tri = prepare_polygon([(0, 0), (10, 0), (0, 10)])
+    c = adjudicate_track(tri, [(8, 7), (3, 4)])
+    assert contact_tuple(c) == (0, (5, 8), (39, 8, 41, 8), 1)
+    # gcd 必须确实约掉：构造 t=2/4 型入口（(-1,0)->(5,0) 沿底边延长贴上 -> (0,0) t=1/6）。
+    sq = prepare_polygon(SQUARE_TRACK)
+    c2 = adjudicate_track(sq, [(-1, 0), (5, 0)])
+    assert contact_tuple(c2) == (0, (1, 6), (0, 1, 0, 1), 0)
+
+
+def test_track_large_coordinates_exact():
+    B = 100_000_000
+    big = prepare_polygon([(-B, -B), (B, -B), (B, B), (-B, B)])
+    c = adjudicate_track(big, [(-2 * B, 0), (2 * B, 0)])
+    assert contact_tuple(c) == (0, (1, 4), (-B, 1, 0, 1), 3)
+    assert adjudicate_track(big, [(-2 * B, 2 * B), (2 * B, 2 * B)]) is None
+
+
+def test_track_orientation_reversal_preserves_conclusion_and_coordinates():
+    pts = [(-5, 5), (15, 5), (-5, 0), (5, 0), (-5, 5), (5, -5),
+           (-5, -5), (-5, 15), (15, 15), (15, 5)]
+    ccw = prepare_polygon(SQUARE_TRACK)
+    cw = prepare_polygon(list(reversed(SQUARE_TRACK)))
+    a, b = adjudicate_track(ccw, pts), adjudicate_track(cw, pts)
+    assert (a is None) == (b is None)
+    assert (a.segment_index, (a.t_num, a.t_den),
+            (a.x_num, a.x_den, a.y_num, a.y_den)) == (
+        b.segment_index, (b.t_num, b.t_den),
+        (b.x_num, b.x_den, b.y_num, b.y_den),
+    )
+    # 接触坐标不随方向改变；边序号可能重编号，但归属同一条几何边（端点集合一致）。
+    ea = ccw.edge(a.edge_index) if a.edge_index is not None else None
+    eb = cw.edge(b.edge_index) if b.edge_index is not None else None
+    assert (ea is None) == (eb is None)
+    if ea is not None:
+        assert {ea[0], ea[1]} == {eb[0], eb[1]}
+
+
+# ---- Fraction 精确参照：独立求解航段与多边形的首次接触，做随机对拍 ----
+
+def ref_boundary_edge(vertices, px, py):
+    m = len(vertices)
+    for i in range(m):
+        ax, ay = vertices[i]
+        bx, by = vertices[(i + 1) % m]
+        if ((bx - ax) * (py - ay) - (by - ay) * (px - ax) == 0
+                and min(ax, bx) <= px <= max(ax, bx)
+                and min(ay, by) <= py <= max(ay, by)):
+            return i
+    return None
+
+
+def ref_track(vertices, points):
+    """Fraction 参照：返回 (段序号, t, x, y, edge_or_None) 或 None。"""
+    m = len(vertices)
+    for seg in range(len(points) - 1):
+        px, py = points[seg]
+        qx, qy = points[seg + 1]
+        hit = ref_boundary_edge(vertices, px, py)
+        if hit is not None:
+            return seg, Fraction(0), Fraction(px), Fraction(py), hit
+        if reference_classify(vertices, px, py) == "INSIDE":
+            return seg, Fraction(0), Fraction(px), Fraction(py), None
+        ux, uy = qx - px, qy - py
+        if ux == 0 and uy == 0:
+            continue
+        best = None
+        for i in range(m):
+            ax, ay = vertices[i]
+            bx, by = vertices[(i + 1) % m]
+            vx, vy = bx - ax, by - ay
+            den = ux * vy - uy * vx
+            t = None
+            if den != 0:
+                wx, wy = ax - px, ay - py
+                tc = Fraction(wx * vy - wy * vx, den)
+                sc = Fraction(wx * uy - wy * ux, den)
+                if 0 < tc <= 1 and 0 <= sc <= 1:
+                    t = tc
+            elif (ax - px) * uy - (ay - py) * ux == 0:
+                ta = Fraction(ax - px, ux) if ux != 0 else Fraction(ay - py, uy)
+                tb = Fraction(bx - px, ux) if ux != 0 else Fraction(by - py, uy)
+                lo, hi = min(ta, tb), max(ta, tb)
+                if hi >= 0:
+                    tc = max(Fraction(0), lo)
+                    if tc <= 1:
+                        t = tc
+            if t is not None and (best is None or t < best[0]):
+                best = (t, i)
+        if best is not None:
+            t, edge = best
+            return seg, t, Fraction(px) + t * ux, Fraction(py) + t * uy, edge
+    return None
+
+
+def test_random_tracks_match_fraction_reference():
+    rng = random.Random(20260917)
+    checked = 0
+    for _ in range(200):
+        pts = random_star_polygon(rng)
+        if pts is None:
+            continue
+        for verts in (pts, list(reversed(pts))):
+            poly = prepare_polygon(verts)
+            xs = [x for x, _ in pts]
+            ys = [y for _, y in pts]
+            for _k in range(6):
+                n = rng.randint(2, 6)
+                track = [(rng.randint(min(xs) - 6, max(xs) + 6),
+                          rng.randint(min(ys) - 6, max(ys) + 6)) for _ in range(n)]
+                got = adjudicate_track(poly, track)
+                want = ref_track(verts, track)
+                if want is None:
+                    assert got is None, (verts, track)
+                else:
+                    ws, wt, wx, wy, we = want
+                    assert got.segment_index == ws, (verts, track, got, want)
+                    assert Fraction(got.t_num, got.t_den) == wt, (verts, track, got, want)
+                    assert Fraction(got.x_num, got.x_den) == wx, (verts, track, got, want)
+                    assert Fraction(got.y_num, got.y_den) == wy, (verts, track, got, want)
+                    assert got.edge_index == we, (verts, track, got, want)
+                checked += 1
+    assert checked > 300

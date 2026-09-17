@@ -19,7 +19,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .geometry import COORD_LIMIT, MAX_POINT_COUNT
+from .geometry import (
+    COORD_LIMIT,
+    MAX_POINT_COUNT,
+    MAX_TRACK_POINT_COUNT,
+    MIN_TRACK_POINT_COUNT,
+)
 
 Decision = Literal["FORBIDDEN", "ALLOWED"]
 ClassificationKind = Literal["INSIDE", "OUTSIDE", "BOUNDARY", "NEAR_BOUNDARY", "PERMITTED_POCKET"]
@@ -123,3 +128,42 @@ class RegionAreaSummaryResponse(BaseModel):
     region_area2: int = Field(description="外环（禁抛区）的绝对二倍面积")
     pockets: list[PocketAreaSummary]
     net_area2: int = Field(description="扣除全部口袋后的二倍面积：region_area2 - sum(pockets.area2)")
+
+
+class AdjudicateTrackRequest(StrictRequestModel):
+    """连续航迹裁决请求：与裁决一致的 region 与 2～100 个有序航点。
+
+    不接收安全距离与许可口袋字段：航迹裁决只回答“整条连续航迹是否
+    接触禁抛区”，逐点接口的定位误差与临时许可语义不在此接口延续；
+    未声明字段由 extra="forbid" 整单 422 拒绝。
+    """
+
+    region: RegionModel
+    waypoints: list[PointModel] = Field(
+        min_length=MIN_TRACK_POINT_COUNT,
+        max_length=MAX_TRACK_POINT_COUNT,
+        description="有序航点：相邻航点构成一个航段，共 n-1 段，从 0 开始编号",
+    )
+
+
+class TrackRationalPoint(BaseModel):
+    # 接触点的有理坐标（约分后的分子/分母）；整数坐标时分母为 1。
+    x_num: int
+    x_den: int
+    y_num: int
+    y_den: int
+
+
+class TrackContactModel(BaseModel):
+    segment_index: int = Field(description="最早受限航段的序号（航点 i -> i+1，从 0 开始）")
+    t_num: int = Field(description="首次接触的航段参数分子（约分后）：P(t)=起点+t*(终点-起点)")
+    t_den: int = Field(description="首次接触的航段参数分母（约分后）")
+    point: TrackRationalPoint = Field(description="首次接触坐标（约分有理数）")
+    edge_index: int | None = Field(
+        description="首次接触归因的区域输入边序号；起点严格位于区域内部时为 null",
+    )
+
+
+class AdjudicateTrackResponse(BaseModel):
+    decision: Literal["CLEAR", "BLOCKED"]
+    contact: TrackContactModel | None = None

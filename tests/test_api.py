@@ -769,3 +769,227 @@ def test_pocket_with_too_few_vertices_reports_indexed_geometry_error():
         body = r.json()
         assert body["error"]["code"] == "NOT_ENOUGH_DISTINCT_VERTICES"
         assert body["error"]["details"]["pocket_index"] == 1
+
+
+# ---------------------------------------------------------------------------
+# POST /adjudicate-track 连续航迹裁决
+# ---------------------------------------------------------------------------
+
+TRACK_SQUARE = [(0, 0), (10, 0), (10, 10), (0, 10)]
+TRACK_SQUARE_CW = list(reversed(TRACK_SQUARE))
+TRACK_TRI = [(0, 0), (10, 0), (0, 10)]
+TRACK_L = [(0, 0), (10, 0), (10, 4), (4, 4), (4, 10), (0, 10)]
+
+
+def post_track(region, waypoints, **extra):
+    payload = {
+        "region": {"vertices": [{"x": x, "y": y} for x, y in region]},
+        "waypoints": [{"x": x, "y": y} for x, y in waypoints],
+    }
+    payload.update(extra)
+    return client.post("/adjudicate-track", json=payload)
+
+
+def test_track_clear_response_shape_for_full_detour():
+    r = post_track(TRACK_SQUARE, [(-5, 5), (-5, 15), (15, 15), (15, 5)])
+    assert r.status_code == 200
+    assert r.json() == {"decision": "CLEAR", "contact": None}
+
+
+def test_track_endpoints_allowed_but_midsegment_crossing_locates_first_entry():
+    # 逐点裁决会放行两端（均在外部），但航段中途穿区：必须阻断并定位首次入口。
+    r = post_track(TRACK_SQUARE, [(-5, 5), (15, 5)])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["decision"] == "BLOCKED"
+    c = body["contact"]
+    assert c["segment_index"] == 0
+    assert (c["t_num"], c["t_den"]) == (1, 4)          # 约分参数
+    assert c["point"] == {"x_num": 0, "x_den": 1, "y_num": 5, "y_den": 1}
+    assert c["edge_index"] == 3
+    # 响应里没有逐点结果等其它字段。
+    assert set(body) == {"decision", "contact"}
+
+
+def test_track_earliest_restricted_segment_index_over_http():
+    # 前两段在外绕行，第三段首次穿区。
+    r = post_track(TRACK_SQUARE, [(-5, -5), (-5, 15), (5, 15), (5, -5)])
+    c = r.json()["contact"]
+    assert r.json()["decision"] == "BLOCKED"
+    assert c["segment_index"] == 2
+    assert (c["t_num"], c["t_den"]) == (1, 4)
+    assert c["point"]["x_num"] == 5 and c["point"]["y_num"] == 10
+    assert c["edge_index"] == 2
+
+
+def test_track_grazing_vertex_is_blocked():
+    # 外 -> 顶点 -> 外的单一切线航段：稳定阻断，接触即顶点，多边命中取最小边序号。
+    r1 = post_track(TRACK_SQUARE, [(-5, 5), (5, -5)])
+    r2 = post_track(TRACK_SQUARE, [(-5, 5), (5, -5)])
+    assert r1.json() == r2.json()  # 重复请求结论与证据完全一致
+    c = r1.json()["contact"]
+    assert r1.json()["decision"] == "BLOCKED"
+    assert c["segment_index"] == 0 and (c["t_num"], c["t_den"]) == (1, 2)
+    assert c["point"]["x_num"] == 0 and c["point"]["y_num"] == 0
+    assert c["edge_index"] == 0  # 顶点 (0,0) 命中边 0/3，取最小
+
+
+def test_track_sailing_along_boundary_blocked_with_overlap_start():
+    # 沿边延长线贴上：共线贴边取重叠起点 (0,0)，t=1/2。
+    r = post_track(TRACK_SQUARE, [(-5, 0), (5, 0)])
+    c = r.json()["contact"]
+    assert r.json()["decision"] == "BLOCKED"
+    assert c["segment_index"] == 0 and (c["t_num"], c["t_den"]) == (1, 2)
+    assert c["point"]["x_num"] == 0 and c["point"]["y_num"] == 0
+    assert c["edge_index"] == 0
+    # 起点已在边上：参数为零。
+    r0 = post_track(TRACK_SQUARE, [(2, 0), (8, 0)])
+    c0 = r0.json()["contact"]
+    assert r0.json()["decision"] == "BLOCKED"
+    assert c0["segment_index"] == 0 and (c0["t_num"], c0["t_den"]) == (0, 1)
+    assert c0["point"]["x_num"] == 2 and c0["point"]["y_num"] == 0
+    assert c0["edge_index"] == 0
+    # 凹多边形沿凹口边航行同样阻断。
+    rl = post_track(TRACK_L, [(4, 11), (4, 5)])
+    cl = rl.json()["contact"]
+    assert rl.json()["decision"] == "BLOCKED"
+    assert (cl["t_num"], cl["t_den"]) == (1, 6)
+    assert cl["point"]["x_num"] == 4 and cl["point"]["y_num"] == 10
+    assert cl["edge_index"] == 3
+
+
+def test_track_start_already_forbidden_parameter_zero():
+    inside = post_track(TRACK_SQUARE, [(5, 5), (15, 5)]).json()
+    assert inside["decision"] == "BLOCKED"
+    ci = inside["contact"]
+    assert ci["segment_index"] == 0 and (ci["t_num"], ci["t_den"]) == (0, 1)
+    assert ci["point"]["x_num"] == 5 and ci["point"]["y_num"] == 5
+    assert ci["edge_index"] is None  # 严格内部起点不归因任何边
+
+
+def test_track_fractional_contact_coordinates_reduced():
+    # 三角形斜边 x+y=10：外 (8,7) -> 内 (3,4)，t=5/8，接触点 (39/8,41/8)。
+    r = post_track(TRACK_TRI, [(8, 7), (3, 4)])
+    c = r.json()["contact"]
+    assert r.json()["decision"] == "BLOCKED"
+    assert (c["t_num"], c["t_den"]) == (5, 8)
+    assert c["point"] == {"x_num": 39, "x_den": 8, "y_num": 41, "y_den": 8}
+    assert c["edge_index"] == 1
+
+
+def test_track_zero_length_segment_uses_single_point_rule():
+    assert post_track(TRACK_SQUARE, [(-5, -5), (-5, -5)]).json() == {
+        "decision": "CLEAR", "contact": None}
+    blocked = post_track(TRACK_SQUARE, [(5, 5), (5, 5)]).json()
+    assert blocked["decision"] == "BLOCKED"
+    assert blocked["contact"]["edge_index"] is None
+    assert (blocked["contact"]["t_num"], blocked["contact"]["t_den"]) == (0, 1)
+    boundary = post_track(TRACK_SQUARE, [(0, 0), (0, 0)]).json()
+    assert boundary["decision"] == "BLOCKED" and boundary["contact"]["edge_index"] == 0
+
+
+def test_track_orientation_reversal_same_decision_and_coordinates():
+    waypoints = [(-5, 5), (15, 5), (-5, 0), (5, 0), (-5, 5), (5, -5),
+                 (-5, -5), (-5, 15), (5, 15), (5, -5)]
+    a = post_track(TRACK_SQUARE, waypoints).json()
+    b = post_track(TRACK_SQUARE_CW, waypoints).json()
+    assert a["decision"] == b["decision"] == "BLOCKED"
+    ca, cb = a["contact"], b["contact"]
+    assert ca["segment_index"] == cb["segment_index"]
+    assert (ca["t_num"], ca["t_den"]) == (cb["t_num"], cb["t_den"])
+    assert ca["point"] == cb["point"]  # 接触坐标与方向无关
+    # 边序号随输入方向重编号，但归属同一条几何边（端点集合一致）。
+    def edge_endpts(vertices, i):
+        return {tuple(vertices[i]), tuple(vertices[(i + 1) % len(vertices)])}
+    assert edge_endpts(TRACK_SQUARE, ca["edge_index"]) == edge_endpts(
+        TRACK_SQUARE_CW, cb["edge_index"])
+
+    # CLEAR 情形在反转下同样 CLEAR。
+    detour = [(-5, 5), (-5, 15), (15, 15), (15, 5)]
+    assert post_track(TRACK_SQUARE, detour).json() == post_track(TRACK_SQUARE_CW, detour).json()
+
+
+def test_track_waypoint_count_limits_422():
+    too_few = post_track(TRACK_SQUARE, [(0, 0)])
+    assert too_few.status_code == 422
+    assert too_few.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert ("body", "waypoints") in _locs(too_few.json())
+
+    too_many = post_track(TRACK_SQUARE, [(i % 7 - 3, i % 5 - 2) for i in range(101)])
+    assert too_many.status_code == 422
+    assert too_many.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert ("body", "waypoints") in _locs(too_many.json())
+
+    # 恰好 2 个与恰好 100 个航点正常受理。
+    assert post_track(TRACK_SQUARE, [(-5, -5), (-5, -5)]).status_code == 200
+    hundred = post_track(TRACK_SQUARE, [(-20, -20)] * 100)
+    assert hundred.status_code == 200
+    assert hundred.json()["decision"] == "CLEAR"
+
+
+def test_track_invalid_region_uses_same_422_envelope():
+    bowtie = [(0, 0), (10, 10), (10, 0), (0, 8)]
+    r = post_track(bowtie, [(-1, -1), (11, 11)])
+    assert r.status_code == 422
+    body = r.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "SELF_INTERSECTING_POLYGON"
+    assert "contact" not in body and "decision" not in body
+
+    collinear = [(0, 0), (5, 0), (10, 0)]
+    assert post_track(collinear, [(-1, 0), (11, 0)]).json()["error"]["code"] == "ZERO_AREA_POLYGON"
+
+
+def test_track_bad_coordinates_and_types_422():
+    for bad in (True, "5", 5.0, 10**9):
+        r = post_track(TRACK_SQUARE, [{"x": bad, "y": 0}, {"x": 1, "y": 1}])
+        assert r.status_code == 422, bad
+        assert r.json()["error"]["code"] == "VALIDATION_ERROR", bad
+
+    # 字段名误拼 / 未声明字段整单 422。
+    r = client.post(
+        "/adjudicate-track",
+        json={"region": {"vertices": [{"x": x, "y": y} for x, y in TRACK_SQUARE]},
+              "waypoints": [{"x": -1, "y": -1}, {"x": 11, "y": 11}],
+              "points": []},
+    )
+    assert r.status_code == 422 and r.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert ("body", "points") in _locs(r.json())
+
+
+def test_track_rejects_margin_and_pocket_fields():
+    r = post_track(TRACK_SQUARE, [(-5, 5), (15, 5)], exclusion_margin_cm=3)
+    assert r.status_code == 422 and r.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert ("body", "exclusion_margin_cm") in _locs(r.json())
+
+    r = post_track(
+        TRACK_SQUARE, [(-5, 5), (15, 5)],
+        permitted_pockets=[{"vertices": [{"x": 1, "y": 1}, {"x": 2, "y": 1}, {"x": 1, "y": 2}]}],
+    )
+    assert r.status_code == 422 and r.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert ("body", "permitted_pockets") in _locs(r.json())
+
+
+def test_track_requires_region_and_waypoints_fields():
+    r = client.post("/adjudicate-track", json={"waypoints": [{"x": 0, "y": 0}, {"x": 1, "y": 1}]})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "VALIDATION_ERROR"
+    r = client.post(
+        "/adjudicate-track",
+        json={"region": {"vertices": [{"x": x, "y": y} for x, y in TRACK_SQUARE]}},
+    )
+    assert r.status_code == 422 and r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_track_large_coordinates_exact_over_http():
+    # 航点坐标必须仍在 ±1e8 内：用边长 1e8 的区域与 ±1e8 的外部航点，
+    # 叉积仍达 1e16 量级，验证大整数下参数与坐标精确。
+    B = 100_000_000
+    h = B // 2
+    big = [(-h, -h), (h, -h), (h, h), (-h, h)]
+    r = post_track(big, [(-B, 0), (B, 0)])
+    c = r.json()["contact"]
+    assert r.json()["decision"] == "BLOCKED"
+    assert (c["t_num"], c["t_den"]) == (1, 4)
+    assert c["point"]["x_num"] == -h and c["point"]["y_num"] == 0
+    assert c["edge_index"] == 3
+    assert post_track(big, [(-B, B), (B, B)]).json()["decision"] == "CLEAR"

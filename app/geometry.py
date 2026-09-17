@@ -27,15 +27,23 @@
 
 面积汇总由 ``doubled_area`` 提供：返回多边形绝对二倍面积（整数，
 与顶点方向及闭合写法无关），供 /region-area-summary 核对申报面积。
+
+连续航迹裁决由 ``adjudicate_track`` 提供：按输入顺序逐航段求与区域
+边界的首次接触（``segment_first_contact``），起点已禁抛时参数为零，
+共线贴边取重叠区间起点，同一参数命中多边取最小输入边序号；接触
+参数与坐标全部以约分有理数（``fractions.Fraction``）比较，无浮点。
 """
 
 from dataclasses import dataclass
+from fractions import Fraction
 from math import gcd
 
 COORD_LIMIT = 100_000_000
 MIN_VERTEX_COUNT = 3
 MAX_VERTEX_COUNT = 200
 MAX_POINT_COUNT = 500
+MIN_TRACK_POINT_COUNT = 2
+MAX_TRACK_POINT_COUNT = 100
 MAX_POCKET_COUNT = 10
 MAX_TOTAL_VERTEX_COUNT = 500
 
@@ -511,4 +519,158 @@ def containing_pocket(pockets: list[Polygon], px: int, py: int) -> int | None:
     for idx, pocket in enumerate(pockets):
         if classify(pocket, px, py).kind == "INSIDE":
             return idx
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 连续航迹：逐航段裁决与区域边界的最早接触
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TrackContact:
+    """最早受限航段与区域边界的首次接触证据。
+
+    segment_index 为航段序号（航点 i -> i+1，从 0 开始）；t_num/t_den
+    为约分后的航段参数（P(t)=起点 + t*(终点-起点)，0 <= t <= 1）；
+    x_num/x_den、y_num/y_den 为接触点的约分有理数坐标；edge_index 为
+    首次接触归因的区域边序号（严格内部起点不接触任何边时为 None）。
+    """
+
+    segment_index: int
+    t_num: int
+    t_den: int
+    x_num: int
+    x_den: int
+    y_num: int
+    y_den: int
+    edge_index: int | None
+
+
+def _collinear_overlap_entry(
+    px: int, py: int, ux: int, uy: int,
+    ax: int, ay: int, bx: int, by: int,
+) -> Fraction | None:
+    """航迹段 P+t*u（0<=t<=1）与共线边 AB 的重叠区间在 t 轴上的最早入口。
+
+    调用方已保证两条直线重合（叉积为 0）。沿 u 方向把 A、B 投影成
+    标量参数（用 u 的非零分量直接相除，正负方向均给出 t=(X-P)/u）；
+    重叠区间与 [0,1] 无交集（边落在航迹段后方或前方延长线上）时
+    返回 None。
+    """
+
+    if ux != 0:
+        ta = Fraction(ax - px, ux)
+        tb = Fraction(bx - px, ux)
+    else:
+        ta = Fraction(ay - py, uy)
+        tb = Fraction(by - py, uy)
+    lo = min(ta, tb)
+    hi = max(ta, tb)
+    if hi < 0:
+        return None
+    entry = max(Fraction(0), lo)
+    if entry > 1:
+        return None
+    return entry
+
+
+def segment_first_contact(
+    poly: Polygon,
+    px: int, py: int,
+    qx: int, qy: int,
+) -> TrackContact | None:
+    """单个航段 P->Q 与区域边界的首次接触；整段不接触区域时返回 None。
+
+    边界归因与点分类沿用同一套规则：先裁决起点（边界/内部即 t=0
+    接触），起点严格在外时逐条边比较接触参数；同一参数命中多条边
+    （如擦过顶点）取最小输入边序号。零长度航段（P==Q）由此自动按
+    单点规则处理：起点评为 BOUNDARY/INSIDE 即在 t=0 阻断，否则放行。
+    坐标与参数一律以约分有理数比较，全程无浮点。
+    """
+
+    start = classify(poly, px, py)
+    if start.kind == "BOUNDARY":
+        # 起点落在边上：参数为零，边序号沿用点分类的最小命中边。
+        return TrackContact(
+            segment_index=0, t_num=0, t_den=1,
+            x_num=px, x_den=1, y_num=py, y_den=1,
+            edge_index=start.boundary_edge,
+        )
+    if start.kind == "INSIDE":
+        # 起点严格在内部：已属禁抛，参数为零，但不接触任何具体边。
+        return TrackContact(
+            segment_index=0, t_num=0, t_den=1,
+            x_num=px, x_den=1, y_num=py, y_den=1,
+            edge_index=None,
+        )
+
+    ux, uy = qx - px, qy - py
+    if ux == 0 and uy == 0:
+        return None  # 零长度航段且起点在外：单点规则放行。
+
+    best_t: Fraction | None = None
+    best_edge = -1
+
+    for i in range(poly.edge_count):
+        (ax, ay), (bx, by) = poly.edge(i)
+        vx, vy = bx - ax, by - ay
+        den = ux * vy - uy * vx  # cross(u, v)
+
+        t: Fraction | None = None
+        if den != 0:
+            # P + t*u = A + s*v：t=cross(w,v)/cross(u,v)，s=cross(w,u)/cross(u,v)，
+            # 其中 w = A-P。t=0 意味着 P 落在边上，已被上面的起点分类排除。
+            w_x, w_y = ax - px, ay - py
+            t_cand = Fraction(w_x * vy - w_y * vx, den)
+            s_cand = Fraction(w_x * uy - w_y * ux, den)
+            if 0 < t_cand <= 1 and 0 <= s_cand <= 1:
+                t = t_cand
+        elif (ax - px) * uy - (ay - py) * ux == 0:
+            # 平行且直线重合（共线贴边）：取重叠区间在 t 轴上的起点。
+            t = _collinear_overlap_entry(px, py, ux, uy, ax, ay, bx, by)
+
+        if t is None:
+            continue
+        # 参数严格更小才更新：边按序号升序扫描，同参数自然保留最小边序号。
+        if best_t is None or t < best_t:
+            best_t, best_edge = t, i
+
+    if best_t is None:
+        return None
+
+    t = best_t
+    x = Fraction(px) + t * ux
+    y = Fraction(py) + t * uy
+    return TrackContact(
+        segment_index=0,
+        t_num=t.numerator, t_den=t.denominator,
+        x_num=x.numerator, x_den=x.denominator,
+        y_num=y.numerator, y_den=y.denominator,
+        edge_index=best_edge,
+    )
+
+
+def adjudicate_track(
+    poly: Polygon, points: list[tuple[int, int]]
+) -> TrackContact | None:
+    """按顺序裁决整条航迹，返回最早受限航段的首次接触；全部绕行返回 None。
+
+    每个航段先判起点：起点已在区域内或边界上即在该段参数 0 处阻断；
+    起点严格在外时才求与边界的交点/贴边入口。因此两端放行但中途
+    穿区的航段会在首次入口处被定位，而仅与区域相切（外部->边界->
+    外部）的航段同样阻断——边界接触一律禁止。
+    """
+
+    for seg in range(len(points) - 1):
+        px, py = points[seg]
+        qx, qy = points[seg + 1]
+        contact = segment_first_contact(poly, px, py, qx, qy)
+        if contact is not None:
+            return TrackContact(
+                segment_index=seg,
+                t_num=contact.t_num, t_den=contact.t_den,
+                x_num=contact.x_num, x_den=contact.x_den,
+                y_num=contact.y_num, y_den=contact.y_den,
+                edge_index=contact.edge_index,
+            )
     return None

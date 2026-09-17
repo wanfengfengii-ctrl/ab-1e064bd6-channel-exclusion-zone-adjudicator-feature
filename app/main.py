@@ -22,6 +22,21 @@ POST /adjudicate
     安全距离为正时许可范围向口袋内部收缩：口袋内部距口袋边界不超
     过该距离的点继续禁抛，沿用既有精确距离证据并标注口袋序号。
     未提交 permitted_pockets 时请求响应与当前版本完全一致。
+POST /adjudicate-track
+    入参::
+
+        {"region": {"vertices": [{"x": .., "y": ..}, ...]},
+         "waypoints": [{"x": .., "y": ..}, ...]}   # 2～100 个有序航点
+
+    连续航迹裁决：逐点裁决会漏掉两个放行航点之间穿入禁抛区的航段，
+    本接口按输入顺序检查每个航段（航点 i -> i+1，序号从 0 开始）。
+    全部航段均不接触区域时返回 CLEAR；否则返回 BLOCKED，并在 contact
+    中给出最早受限航段序号、该段首次接触参数 t（约分分数，起点已
+    禁抛时为 0）、接触坐标（约分有理数）与归因的区域输入边序号
+    （起点严格位于区域内部时为 null；同参数命中多边取最小序号；
+    共线贴边取重叠起点）。零长度航段按单点规则处理。区域或航点
+    非法时按现有错误信封整单返回 422。本接口不接收安全距离与
+    permitted_pockets 等未声明字段。
 POST /region-area-summary
     入参::
 
@@ -48,6 +63,7 @@ from .geometry import (
     NearestEdge,
     Polygon,
     PolygonError,
+    adjudicate_track,
     classify,
     containing_pocket,
     doubled_area,
@@ -59,18 +75,22 @@ from .geometry import (
 from .models import (
     AdjudicateRequest,
     AdjudicateResponse,
+    AdjudicateTrackRequest,
+    AdjudicateTrackResponse,
     PocketAreaSummary,
     PointModel,
     PointResult,
     PolygonSummary,
     RegionAreaSummaryRequest,
     RegionAreaSummaryResponse,
+    TrackContactModel,
+    TrackRationalPoint,
 )
 
 app = FastAPI(
     title="Dredging Spoil Dumping Adjudication Service",
-    version="1.3.0",
-    description="纯整数计算几何：判定点位于禁抛区内部、外部还是边界，支持边界安全距离、区内许可口袋与区域面积核对。",
+    version="1.4.0",
+    description="纯整数计算几何：判定点位于禁抛区内部、外部还是边界，支持边界安全距离、区内许可口袋、区域面积核对与连续航迹裁决。",
 )
 
 
@@ -229,6 +249,32 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
             signed_area2=poly.signed_area2,
         ),
         results=results,
+    )
+
+
+@app.post("/adjudicate-track", response_model=AdjudicateTrackResponse)
+def adjudicate_track_endpoint(req: AdjudicateTrackRequest) -> AdjudicateTrackResponse:
+    # 区域复用与裁决完全一致的多边形规整；非法时同一 422 信封，无部分结果。
+    raw = [[v.x, v.y] for v in req.region.vertices]
+    poly = prepare_polygon(raw)
+    waypoints = [(p.x, p.y) for p in req.waypoints]
+    contact = adjudicate_track(poly, waypoints)
+    if contact is None:
+        return AdjudicateTrackResponse(decision="CLEAR", contact=None)
+    return AdjudicateTrackResponse(
+        decision="BLOCKED",
+        contact=TrackContactModel(
+            segment_index=contact.segment_index,
+            t_num=contact.t_num,
+            t_den=contact.t_den,
+            point=TrackRationalPoint(
+                x_num=contact.x_num,
+                x_den=contact.x_den,
+                y_num=contact.y_num,
+                y_den=contact.y_den,
+            ),
+            edge_index=contact.edge_index,
+        ),
     )
 
 

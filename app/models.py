@@ -19,10 +19,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .geometry import COORD_LIMIT, MAX_POINT_COUNT
+from .geometry import COORD_LIMIT, MAX_POINT_COUNT, MAX_TRACK_WAYPOINT_COUNT
 
 Decision = Literal["FORBIDDEN", "ALLOWED"]
 ClassificationKind = Literal["INSIDE", "OUTSIDE", "BOUNDARY", "NEAR_BOUNDARY", "PERMITTED_POCKET"]
+TrackDecision = Literal["CLEAR", "BLOCKED"]
 
 
 class StrictRequestModel(BaseModel):
@@ -123,3 +124,43 @@ class RegionAreaSummaryResponse(BaseModel):
     region_area2: int = Field(description="外环（禁抛区）的绝对二倍面积")
     pockets: list[PocketAreaSummary]
     net_area2: int = Field(description="扣除全部口袋后的二倍面积：region_area2 - sum(pockets.area2)")
+
+
+class AdjudicateTrackRequest(StrictRequestModel):
+    """连续航迹裁决请求：现有 region 加二至一百个有序航点。
+
+    不接收待判点、安全距离与许可口袋——本接口只裁决相邻航点构成的
+    航段是否穿入禁抛区；未声明字段由 extra="forbid" 整单 422。
+    """
+
+    region: RegionModel
+    # 航点数量下限 2（至少一条航段）、上限 100 在本层裁决；坐标合法性
+    # 沿用 PointModel 的严格整数规则，区域合法性仍在几何层裁决。
+    waypoints: list[PointModel] = Field(
+        min_length=2,
+        max_length=MAX_TRACK_WAYPOINT_COUNT,
+        description="有序航点（2~100 个），相邻航点依次构成航段",
+    )
+
+
+class TrackContactResult(BaseModel):
+    """最早受限航段的首次接触；参数与坐标均为约分有理数（分母为正）。"""
+
+    segment_index: int = Field(description="最早受限航段序号：waypoints[i] -> waypoints[i+1]")
+    t_num: int = Field(description="首次接触参数的分子（约分后，0 <= t <= 1）")
+    t_den: int = Field(description="首次接触参数的分母（约分后，正）")
+    x_num: int = Field(description="接触点 x 坐标的分子（约分后）")
+    x_den: int = Field(description="接触点 x 坐标的分母（约分后，正）")
+    y_num: int = Field(description="接触点 y 坐标的分子（约分后）")
+    y_den: int = Field(description="接触点 y 坐标的分母（约分后，正）")
+    edge_index: int | None = Field(
+        description="接触命中的最小输入边序号；起点严格位于禁抛区内部时为 null"
+    )
+
+
+class AdjudicateTrackResponse(BaseModel):
+    decision: TrackDecision
+    polygon: PolygonSummary
+    contact: TrackContactResult | None = Field(
+        description="BLOCKED 时给出最早受限航段的首次接触；CLEAR 时为 null"
+    )

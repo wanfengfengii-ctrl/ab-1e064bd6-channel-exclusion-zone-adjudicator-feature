@@ -21,6 +21,7 @@ import urllib.request
 API = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 URL = f"{API}/adjudicate"
 SUMMARY_URL = f"{API}/region-area-summary"
+TRACK_URL = f"{API}/adjudicate-track"
 
 failures: list[str] = []
 checks = 0
@@ -71,6 +72,27 @@ def call_summary(vertices, *, pockets=None, extra=None, expect_status=200):
         payload.update(extra)
     body = json.dumps(payload).encode()
     req = urllib.request.Request(SUMMARY_URL, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        payload = json.loads(exc.read())
+        if expect_status != exc.code:
+            raise AssertionError(f"expected {expect_status}, got {exc.code}: {payload}")
+        return exc.code, payload
+
+
+def call_track(vertices, waypoints, *, extra=None, expect_status=200):
+    """调用 POST /adjudicate-track；extra 用于夹带未声明字段的拒绝检查。"""
+
+    payload = {
+        "region": {"vertices": [{"x": x, "y": y} for x, y in vertices]},
+        "waypoints": [{"x": x, "y": y} for x, y in waypoints],
+    }
+    if extra:
+        payload.update(extra)
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(TRACK_URL, data=body, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read())
@@ -527,6 +549,167 @@ def main() -> int:
               and any(issue.get("loc") == ["body", name]
                       for issue in body["error"]["details"].get("issues", [])),
               f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+
+    # --- 10. POST /adjudicate-track 连续航迹裁决 ------------------------------
+    print("[10] POST /adjudicate-track 连续航迹裁决")
+
+    # 两端航点逐点裁决均放行，但航段中途穿区：BLOCKED 并定位首次入口。
+    _, body = call_track(square, [(-5, 5), (15, 5)])
+    c = body.get("contact") or {}
+    check("两端放行但中途穿区：BLOCKED 并定位首次入口",
+          body.get("decision") == "BLOCKED"
+          and c.get("segment_index") == 0
+          and (c.get("t_num"), c.get("t_den")) == (1, 4)
+          and (c.get("x_num"), c.get("x_den")) == (0, 1)
+          and (c.get("y_num"), c.get("y_den")) == (5, 1)
+          and c.get("edge_index") == 3,
+          json.dumps(body, ensure_ascii=False))
+    # 首次进入发生在后续航段：报告最早受限航段序号。
+    _, body = call_track(square, [(-5, -5), (-5, 5), (15, 5)])
+    c = body.get("contact") or {}
+    check("首次进入发生在航段 1 时报告最早受限航段",
+          body.get("decision") == "BLOCKED"
+          and c.get("segment_index") == 1
+          and (c.get("t_num"), c.get("t_den")) == (1, 4)
+          and (c.get("x_num"), c.get("y_num")) == (0, 5),
+          json.dumps(body, ensure_ascii=False))
+
+    # 擦过顶点与沿边航行：稳定阻断（重复请求完全一致），顶点命中多边取最小边序号。
+    _, graze1 = call_track(square, [(-5, 5), (5, -5)])
+    _, graze2 = call_track(square, [(-5, 5), (5, -5)])
+    c = graze1.get("contact") or {}
+    check("擦过顶点稳定阻断，接触坐标即顶点且取最小边序号",
+          graze1 == graze2
+          and graze1.get("decision") == "BLOCKED"
+          and (c.get("t_num"), c.get("t_den")) == (1, 2)
+          and (c.get("x_num"), c.get("y_num")) == (0, 0)
+          and c.get("edge_index") == 0,
+          json.dumps(graze1, ensure_ascii=False))
+    _, hug1 = call_track(square, [(-5, 0), (15, 0)])
+    _, hug2 = call_track(square, [(-5, 0), (15, 0)])
+    c = hug1.get("contact") or {}
+    check("沿边航行稳定阻断，共线贴边取重叠起点",
+          hug1 == hug2
+          and hug1.get("decision") == "BLOCKED"
+          and (c.get("t_num"), c.get("t_den")) == (1, 4)
+          and (c.get("x_num"), c.get("y_num")) == (0, 0)
+          and c.get("edge_index") == 0,
+          json.dumps(hug1, ensure_ascii=False))
+
+    # 完全绕行：全部航段不接触禁抛区，CLEAR 且无接触信息。
+    _, body = call_track(square, [(-5, -5), (15, -5), (15, 15), (-5, 15), (-5, -5)])
+    check("完全绕行返回 CLEAR 且无接触信息",
+          body.get("decision") == "CLEAR" and body.get("contact") is None,
+          json.dumps(body, ensure_ascii=False))
+
+    # 起点已禁抛：参数为零；严格内部起点边序号为 null，边界起点取最小边序号。
+    _, body = call_track(square, [(5, 5), (20, 20)])
+    c = body.get("contact") or {}
+    check("起点在禁抛区内部：参数为零且边序号为 null",
+          body.get("decision") == "BLOCKED"
+          and (c.get("t_num"), c.get("t_den")) == (0, 1)
+          and (c.get("x_num"), c.get("y_num")) == (5, 5)
+          and c.get("edge_index") is None,
+          json.dumps(body, ensure_ascii=False))
+    _, body = call_track(square, [(0, 5), (20, 20)])
+    c = body.get("contact") or {}
+    check("起点压在边界上：参数为零且归因最小边序号",
+          body.get("decision") == "BLOCKED"
+          and (c.get("t_num"), c.get("t_den")) == (0, 1)
+          and c.get("edge_index") == 3,
+          json.dumps(body, ensure_ascii=False))
+
+    # 零长度航段按单点规则处理。
+    _, body = call_track(square, [(-5, -5), (-5, -5)])
+    check("零长度航段在外部不构成接触",
+          body.get("decision") == "CLEAR" and body.get("contact") is None,
+          json.dumps(body, ensure_ascii=False))
+    _, body = call_track(square, [(5, 5), (5, 5)])
+    c = body.get("contact") or {}
+    check("零长度航段在内部构成参数为零的接触",
+          body.get("decision") == "BLOCKED"
+          and (c.get("t_num"), c.get("t_den")) == (0, 1)
+          and c.get("edge_index") is None,
+          json.dumps(body, ensure_ascii=False))
+
+    # 方向反转不改变结论与接触坐标（边序号随编号方案变化，不在不变量内）。
+    tracks = [
+        [(-5, 5), (15, 5)],
+        [(-5, 5), (5, -5)],
+        [(-5, 0), (15, 0)],
+        [(-5, -5), (15, -5), (15, 15), (-5, 15), (-5, -5)],
+        [(5, 5), (20, 20)],
+        [(-5, 3), (5, 8)],
+    ]
+    invariant = True
+    for wps in tracks:
+        _, body_a = call_track(square, wps)
+        _, body_b = call_track(square_cw, wps)
+        if body_a.get("decision") != body_b.get("decision"):
+            invariant = False
+            break
+        ca, cb = body_a.get("contact"), body_b.get("contact")
+        if (ca is None) != (cb is None):
+            invariant = False
+            break
+        if ca is not None:
+            keys = ("segment_index", "t_num", "t_den", "x_num", "x_den", "y_num", "y_den")
+            if any(ca.get(k) != cb.get(k) for k in keys):
+                invariant = False
+                break
+    check("反转区域方向不改变结论与接触坐标", invariant,
+          f"track={wps} ccw={json.dumps(body_a, ensure_ascii=False)} "
+          f"cw={json.dumps(body_b, ensure_ascii=False)}")
+
+    # 接触坐标为真分数时以约分有理数给出。
+    _, body = call_track(square, [(-5, 3), (5, 8)])
+    c = body.get("contact") or {}
+    check("真分数接触坐标以约分有理数给出",
+          (c.get("t_num"), c.get("t_den")) == (1, 2)
+          and (c.get("x_num"), c.get("x_den"),
+               c.get("y_num"), c.get("y_den")) == (0, 1, 11, 2),
+          json.dumps(body, ensure_ascii=False))
+
+    # 航点数量、坐标与区域非法：整单 422，同一错误信封，无部分结果。
+    for name, wps in [("仅 1 个航点", [(0, 0)]), ("101 个航点", [(0, 0)] * 101)]:
+        status, body = call_track(square, wps, expect_status=422)
+        check(f"航点数量非法（{name}）整单 422 且无结果",
+              status == 422 and set(body.keys()) == {"error"}
+              and body["error"]["code"] == "VALIDATION_ERROR"
+              and "contact" not in body,
+              f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+    status, body = call_track(square, [(0, 0)] * 100)
+    check("100 个航点正常受理", status == 200, f"{status}")
+    status, body = call_track(square, [(10**9, 0), (15, 5)], expect_status=422)
+    check("航点坐标越界整单 422",
+          status == 422 and body["error"]["code"] == "VALIDATION_ERROR",
+          f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+    status, body = call_track([(0, 0), (10, 10), (10, 0), (0, 8)], [(-5, 5), (15, 5)],
+                              expect_status=422)
+    check("非法区域整单 422 且无部分结果",
+          status == 422 and set(body.keys()) == {"error"}
+          and body["error"]["code"] == "SELF_INTERSECTING_POLYGON"
+          and "contact" not in body,
+          f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+    status, body = call_track(square, [(-5, 5), (15, 5)],
+                              extra={"exclusion_margin_cm": 3}, expect_status=422)
+    check("航迹接口拒绝未声明字段（安全距离）",
+          status == 422 and body["error"]["code"] == "VALIDATION_ERROR"
+          and any(issue.get("loc") == ["body", "exclusion_margin_cm"]
+                  for issue in body["error"]["details"].get("issues", [])),
+          f"{status} {json.dumps(body, ensure_ascii=False)[:200]}")
+
+    # 大坐标：1e8 量级下接触参数与坐标保持整数精确。
+    B = 100_000_000
+    _, body = call_track([(0, 0), (B, 0), (0, B)], [(-1, B // 2), (B // 2, B // 2)])
+    c = body.get("contact") or {}
+    check("大坐标接触参数与坐标整数精确",
+          body.get("decision") == "BLOCKED"
+          and (c.get("t_num"), c.get("t_den")) == (1, B // 2 + 1)
+          and (c.get("x_num"), c.get("x_den"),
+               c.get("y_num"), c.get("y_den")) == (0, 1, B // 2, 1)
+          and c.get("edge_index") == 2,
+          json.dumps(body, ensure_ascii=False))
 
     print(f"\n== {checks} checks, {len(failures)} failures ==")
     if failures:

@@ -27,6 +27,12 @@
 
 面积汇总由 ``doubled_area`` 提供：返回多边形绝对二倍面积（整数，
 与顶点方向及闭合写法无关），供 /region-area-summary 核对申报面积。
+
+连续航迹裁决由 ``first_track_contact`` 提供：把有序航点连成航段，
+逐段计算与禁抛区（含边界）的首次接触。接触参数与接触坐标一律以
+约分有理数给出（分子/分母），各航段与区域边界的接触位置用整数叉积
+求出参数后交叉相乘比较，全程无浮点；起点已禁抛时参数为零，共线贴边
+取重叠起点，同一接触点命中多条边时取最小输入边序号。
 """
 
 from dataclasses import dataclass
@@ -38,6 +44,7 @@ MAX_VERTEX_COUNT = 200
 MAX_POINT_COUNT = 500
 MAX_POCKET_COUNT = 10
 MAX_TOTAL_VERTEX_COUNT = 500
+MAX_TRACK_WAYPOINT_COUNT = 100
 
 
 class PolygonError(ValueError):
@@ -511,4 +518,154 @@ def containing_pocket(pockets: list[Polygon], px: int, py: int) -> int | None:
     for idx, pocket in enumerate(pockets):
         if classify(pocket, px, py).kind == "INSIDE":
             return idx
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 连续航迹裁决：航段与区域边界的首次接触
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TrackContact:
+    """最早受限航段的首次接触证据；参数与坐标均为约分有理数。
+
+    航段 i 为 waypoints[i] -> waypoints[i+1]；接触点 = A + t*(B-A)，
+    t = t_num / t_den（0 <= t <= 1，已约分，分母为正）。接触坐标同样
+    以约分有理数给出（x_num/x_den, y_num/y_den）。edge_index 为接触
+    命中的最小输入边序号；起点严格位于禁抛区内部时，首次接触是起点
+    本身、不涉及任何边，edge_index 为 None。
+    """
+
+    segment_index: int
+    t_num: int
+    t_den: int
+    x_num: int
+    x_den: int
+    y_num: int
+    y_den: int
+    edge_index: int | None
+
+
+def _reduce_fraction(num: int, den: int) -> tuple[int, int]:
+    """约分并把符号归一到分母为正；den 不得为 0。"""
+
+    if den < 0:
+        num, den = -num, -den
+    g = gcd(num, den)
+    return num // g, den // g
+
+
+def _edge_contact_param(
+    ax: int, ay: int, bx: int, by: int, cx: int, cy: int, dx: int, dy: int
+) -> tuple[int, int] | None:
+    """航段 A->B 与区域边 C->D 的首次接触参数，返回 ``(t_num, t_den)``。
+
+    无接触返回 None。假定航段非零长度且起点 A 不在该边上（调用方已按
+    单点规则分类）。返回的分数未约分，但分母已归一为正，可直接交叉
+    相乘比较大小。
+
+    * 非平行：唯一交点由整数叉积给出，t = (C-A)x(D-C) / (B-A)x(D-C)，
+      边参数 s = (C-A)x(B-A) / 同一分母；t 与 s 均落在 [0,1] 时接触
+      （含正常穿越、端点相接与顶点擦过）；
+    * 共线：重叠区间的起点即首次接触（共线贴边取重叠起点），以 A->B
+      方向上的投影参数计算，分母为 |B-A|²。
+    """
+
+    ux, uy = bx - ax, by - ay
+    vx, vy = dx - cx, dy - cy
+    cr = ux * vy - uy * vx
+    if cr != 0:
+        t_num = cross(ax, ay, cx, cy, dx, dy)
+        s_num = cross(ax, ay, cx, cy, bx, by)
+        if cr < 0:
+            cr, t_num, s_num = -cr, -t_num, -s_num
+        if 0 <= t_num <= cr and 0 <= s_num <= cr:
+            return t_num, cr
+        return None
+    if cross(ax, ay, bx, by, cx, cy) != 0:
+        return None  # 平行但不共线：无公共点
+    len2 = ux * ux + uy * uy
+    t_c = (cx - ax) * ux + (cy - ay) * uy
+    t_d = (dx - ax) * ux + (dy - ay) * uy
+    lo, hi = (t_c, t_d) if t_c <= t_d else (t_d, t_c)
+    start = max(0, lo)
+    if start <= min(len2, hi):
+        return start, len2
+    return None
+
+
+def _make_contact(
+    segment_index: int,
+    t_num: int,
+    t_den: int,
+    ax: int,
+    ay: int,
+    ux: int,
+    uy: int,
+    edge_index: int | None,
+) -> TrackContact:
+    """由航段参数构造接触证据：t 先约分，接触坐标再分别约分。"""
+
+    t_num, t_den = _reduce_fraction(t_num, t_den)
+    x_num, x_den = _reduce_fraction(ax * t_den + ux * t_num, t_den)
+    y_num, y_den = _reduce_fraction(ay * t_den + uy * t_num, t_den)
+    return TrackContact(
+        segment_index=segment_index,
+        t_num=t_num,
+        t_den=t_den,
+        x_num=x_num,
+        x_den=x_den,
+        y_num=y_num,
+        y_den=y_den,
+        edge_index=edge_index,
+    )
+
+
+def _segment_contact(
+    poly: Polygon, segment_index: int, ax: int, ay: int, bx: int, by: int
+) -> TrackContact | None:
+    """单条航段与禁抛区（含边界）的首次接触；无接触返回 None。
+
+    起点已禁抛（内部或边界）时参数为零、接触点即起点：边界起点沿用
+    既有边界归因取最小边序号，严格内部起点不归属任何边。零长度航段
+    按单点规则处理：仅当该点本身禁抛时构成参数为零的接触。
+    """
+
+    cls = classify(poly, ax, ay)
+    if cls.kind != "OUTSIDE":
+        return _make_contact(segment_index, 0, 1, ax, ay, 0, 0, cls.boundary_edge)
+    ux, uy = bx - ax, by - ay
+    if ux == 0 and uy == 0:
+        return None
+    best_num = best_den = 0
+    best_edge = -1
+    for i in range(poly.edge_count):
+        (cx, cy), (dx, dy) = poly.edge(i)
+        hit = _edge_contact_param(ax, ay, bx, by, cx, cy, dx, dy)
+        if hit is None:
+            continue
+        t_num, t_den = hit
+        # 分母已归一为正，交叉相乘比较；仅在严格更小时更新，因此同一
+        # 接触点命中多条边（顶点、共线重叠起点）时保留最小输入边序号。
+        if best_edge < 0 or t_num * best_den < best_num * t_den:
+            best_num, best_den, best_edge = t_num, t_den, i
+    if best_edge < 0:
+        return None
+    return _make_contact(segment_index, best_num, best_den, ax, ay, ux, uy, best_edge)
+
+
+def first_track_contact(
+    poly: Polygon, waypoints: list[tuple[int, int]]
+) -> TrackContact | None:
+    """按航段顺序扫描整条航迹，返回最早受限航段的首次接触。
+
+    航段 i 为 waypoints[i] -> waypoints[i+1]；全部航段均未接触禁抛区
+    （含边界）时返回 None，即航迹 CLEAR。
+    """
+
+    for i in range(len(waypoints) - 1):
+        (ax, ay), (bx, by) = waypoints[i], waypoints[i + 1]
+        contact = _segment_contact(poly, i, ax, ay, bx, by)
+        if contact is not None:
+            return contact
     return None
